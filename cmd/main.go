@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -28,7 +29,8 @@ type RequestUser struct {
 
 var jwtSecret = []byte("secret")
 
-var users = map[string]Login{}
+var users = make(map[string]*Login)
+var mu sync.RWMutex
 
 func main() {
 	r := chi.NewRouter()
@@ -37,108 +39,120 @@ func main() {
 	r.Post("/login", handleLogin)
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware)
-		r.Post("/private", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(fmt.Sprintf("Hello %s", r.Context().Value("username"))))
-		})
-		r.Post("/logout", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Set-Cookie", "csrf_token=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly=false")
-			w.Header().Set("Set-Cookie", "session_token=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly=true")
-			username := r.Context().Value("username").(string)
-			user, _ := users[username]
-			user.CSRFToken = ""
-			user.JWToken = ""
-			users[username] = user
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(fmt.Sprintf("Goodbye %s", r.Context().Value("username"))))
-		})
+		r.Post("/private", handlePrivate)
+		r.Post("/logout", handleLogout)
 	})
 
-	http.ListenAndServe(":8080", r)
+	fmt.Println("Starting server on :8080")
+	if err := http.ListenAndServe(":8080", r); err != nil {
+		log.Fatal("Failed to start server:", err)
+	}
+}
 
+func handlePrivate(w http.ResponseWriter, r *http.Request) {
+	username := r.Context().Value("username").(string)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Hello %s", username)))
 }
 
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	reqUser := RequestUser{}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	err = json.Unmarshal(body, &reqUser)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	if len(reqUser.Password) < 8 && len(reqUser.Username) < 4 {
-		w.WriteHeader(http.StatusNotAcceptable)
-		w.Write([]byte("Password too short"))
+	if err != nil || len(reqUser.Password) < 8 || len(reqUser.Username) < 4 {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	if _, ok := users[reqUser.Username]; ok {
-		w.WriteHeader(http.StatusNotAcceptable)
-		w.Write([]byte("User already exists"))
+		http.Error(w, "User already exists", http.StatusConflict)
 		return
 	}
 
 	hashPassword, err := hashPassword(reqUser.Password)
-
-	users[reqUser.Username] = Login{
-		HashPassword: hashPassword,
+	if err != nil {
+		http.Error(w, "Error hashing password", http.StatusInternalServerError)
+		return
 	}
 
+	users[reqUser.Username] = &Login{HashPassword: hashPassword}
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte("User created"))
-
 }
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	reqUser := RequestUser{}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	err = json.Unmarshal(body, &reqUser)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+
+	mu.RLock()
 	user, ok := users[reqUser.Username]
-	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("User not found"))
-		return
-	}
-	if !checkPasswordHash(reqUser.Password, users[reqUser.Username].HashPassword) {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("Wrong password"))
+	mu.RUnlock()
+	if !ok || !checkPasswordHash(reqUser.Password, user.HashPassword) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	JWToken, err := generateJWToken(reqUser.Username)
+	if err != nil {
+		http.Error(w, "Error generating token", http.StatusInternalServerError)
+		return
+	}
 	csrfToken := generateCSRFToken(32)
+
 	user.JWToken = JWToken
 	user.CSRFToken = csrfToken
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     "csrf_token",
 		Value:    csrfToken,
-		Expires:  time.Now().Add(time.Hour * 24),
+		Path:     "/",
 		HttpOnly: false,
+		MaxAge:   86400,
 	})
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_token",
 		Value:    JWToken,
-		Expires:  time.Now().Add(time.Hour * 24),
+		Path:     "/",
 		HttpOnly: true,
+		MaxAge:   86400,
 	})
-
-	users[reqUser.Username] = user
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("Hello %s", reqUser.Username)))
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	username := r.Context().Value("username").(string)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	user, exists := users[username]
+	if exists {
+		user.CSRFToken = ""
+		user.JWToken = ""
+	}
+
+	w.Header().Set("Set-Cookie", "csrf_token=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly=false")
+	w.Header().Set("Set-Cookie", "session_token=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly=true")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Goodbye %s", username)))
 }
 
 func hashPassword(password string) (string, error) {
@@ -151,74 +165,49 @@ func hashPassword(password string) (string, error) {
 
 func checkPasswordHash(password, hash string) bool {
 	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	if err != nil {
-		return false
-	}
-	return true
+	return err == nil
 }
 
 func generateCSRFToken(len int) string {
 	bytes := make([]byte, len)
 	if _, err := rand.Read(bytes); err != nil {
-		log.Fatal("failed to generate CSRF token: ", err)
+		log.Fatal("failed to generate CSRF token:", err)
 	}
 	return base64.URLEncoding.EncodeToString(bytes)
 }
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqUser := RequestUser{}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		err = json.Unmarshal(body, &reqUser)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println(reqUser.Username)
-		user, ok := users[reqUser.Username]
-		if !ok {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
 		cookie, err := r.Cookie("session_token")
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
+		if err != nil || cookie.Value == "" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		token := cookie.Value
 
-		fmt.Println(token)
-
-		if token == "" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		_, err = ValidateToken(token)
+		claims, err := ValidateToken(cookie.Value)
 		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+
 		csrf := r.Header.Get("X-Csrf-Token")
-		fmt.Println(csrf)
-		fmt.Println(user.CSRFToken)
-		if csrf == "" || csrf != user.CSRFToken {
-			w.WriteHeader(http.StatusUnauthorized)
+		mu.RLock()
+		user, ok := users[claims.Username]
+		mu.RUnlock()
+
+		if !ok || csrf == "" || csrf != user.CSRFToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		ctx := context.WithValue(r.Context(), "username", reqUser.Username)
+
+		ctx := context.WithValue(r.Context(), "username", claims.Username)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 type Claims struct {
-	Username string
+	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
 
